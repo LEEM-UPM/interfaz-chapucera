@@ -12,12 +12,12 @@ import sys
 
 # ---------- CONFIGURACIÓN ----------
 TIMEOUT = 1
-COMANDO_IGNITAR = b'IGNITAR\n'
+COMANDO_IGNITAR = b'\x01'  # Se envía 1 byte para ignitar
 COMANDO_DATOS = b'\x02'
 COMANDO_STOP = b'\x03'
-COMANDO_IGNICION = b'\x04'
-BYTES_POR_PAQUETE = 24  # >>> MODIFICADO <<<
+BYTES_POR_PAQUETE = 24
 MAX_PUNTOS = 1000
+CUENTA_REGRESIVA = 10  # segundos
 # ----------------------------------
 
 # ---------- VARIABLES GLOBALES ----------
@@ -35,10 +35,11 @@ hz_actual = 0.0
 # Datos para gráficas
 tiempos = deque(maxlen=MAX_PUNTOS)
 presiones = deque(maxlen=MAX_PUNTOS)
-ns = deque(maxlen=MAX_PUNTOS)  # Newtons
-temperaturas = [deque(maxlen=MAX_PUNTOS) for _ in range(10)]  # >>> MODIFICADO <<<
+ns = deque(maxlen=MAX_PUNTOS)
+temperaturas = [deque(maxlen=MAX_PUNTOS) for _ in range(10)]
 
 # ---------------- FUNCIONES ----------------
+
 # ---------- BOTONES ----------
 def conectar():
     global ser, leyendo, archivo_salida
@@ -66,8 +67,8 @@ def conectar():
         messagebox.showerror("Error", str(e))
 
 def desconectar():
-    global ser, leyendo, medicion_activa, ignition_countdown
-    global ignitar_flag, contador_paquetes, ultimo_calculo_hz, hz_actual
+    global ser, leyendo, medicion_activa, ignition_countdown, ignitar_flag
+    global contador_paquetes, ultimo_calculo_hz, hz_actual
 
     leyendo = False
     medicion_activa = False
@@ -87,6 +88,7 @@ def desconectar():
     btn_start_stop.config(text="START", bg="green")
     btn_conectar.config(state="normal")
     btn_desconectar.config(state="disabled")
+    btn_ignitar.config(state="normal")
 
 # ---------- START / STOP ----------
 def toggle_medicion():
@@ -132,6 +134,45 @@ def get_value():
         return
     ser.write(bytes([0x01]))
 
+# ---------- BOTÓN IGNITAR ----------
+def iniciar_ignitar():
+    global ignition_countdown
+
+    if not ser or not ser.is_open:
+        messagebox.showwarning("Aviso", "Conecta el puerto primero")
+        return
+
+    # Doble confirmación
+    if not messagebox.askyesno("Confirmación", "¿Estás seguro de que quieres iniciar la ignición?"):
+        return
+    if not messagebox.askyesno("Confirmación final", "Esta acción no se puede deshacer. ¿Deseas continuar?"):
+        return
+
+    # Desactivar botón para evitar presionar varias veces
+    btn_ignitar.config(state="disabled")
+    ignition_countdown = True
+    threading.Thread(target=cuenta_regresiva_ignitar, daemon=True).start()
+
+def cuenta_regresiva_ignitar():
+    global ignition_countdown, ignitar_flag
+    for i in range(CUENTA_REGRESIVA, 0, -1):
+        # Mostrar cuenta atrás en ventana aparte (label temporal)
+        countdown_label.config(text=f"¡Ignición en {i} s!", fg="red", font=("Arial", 20, "bold"))
+        time.sleep(1)
+
+    # Enviar comando de ignición
+    try:
+        ser.write(COMANDO_IGNITAR)
+        ignitar_flag = True
+        countdown_label.config(text="¡Ignición ACTIVADA!", fg="green", font=("Arial", 20, "bold"))
+    except Exception as e:
+        messagebox.showerror("Error", f"No se pudo enviar el comando de ignición: {e}")
+
+    ignition_countdown = False
+    btn_ignitar.config(state="normal")
+    time.sleep(2)
+    countdown_label.config(text="")  # Limpiar label tras 2 segundos
+
 # ---------- PUERTOS ----------
 def obtener_puertos():
     return [p.device for p in serial.tools.list_ports.comports()]
@@ -141,7 +182,7 @@ def refrescar_puertos():
 
     nuevos_puertos = obtener_puertos()
     if not nuevos_puertos:
-        nuevos_puertos = ["No hay puertos"]  # Siempre al menos uno
+        nuevos_puertos = ["No hay puertos"]
 
     if nuevos_puertos != puertos_actuales:
         puertos_actuales = nuevos_puertos
@@ -170,7 +211,6 @@ def leer_datos():
             if len(raw) != 24:
                 continue
 
-            # >>> MODIFICADO <<< (sin header)
             valores = struct.unpack("<12H", raw)
 
             ahora = time.time()
@@ -209,6 +249,7 @@ def leer_datos():
             for i in range(10):
                 temperaturas[i].append(tp[i])
 
+            # Solo actualizar el label de valor normal, no interferir con countdown_label
             valor_label.config(
                 text=f"P: {presion} | N: {fuerza} | t: {tiempo_s:.2f}s",
                 font=("Arial", 12),
@@ -281,8 +322,6 @@ if not puertos_actuales:
     puertos_actuales = ["No hay puertos"]
 
 puerto_var.set(puertos_actuales[0])
-
-# Separar primer valor del resto
 puerto_menu = tk.OptionMenu(frame_config, puerto_var, puertos_actuales[0], *puertos_actuales[1:])
 puerto_menu.pack(fill="x")
 
@@ -306,6 +345,10 @@ hz_label.pack(pady=5)
 valor_label = tk.Label(frame_config, text="Valor: ---")
 valor_label.pack(pady=10)
 
+# Label para mostrar la cuenta atrás de ignición
+countdown_label = tk.Label(frame_config, text="", fg="red", font=("Arial", 14, "bold"))
+countdown_label.pack(pady=5)
+
 btn_conectar = tk.Button(frame_config, text="Conectar", width=15, command=conectar)
 btn_conectar.pack(pady=3)
 
@@ -327,6 +370,14 @@ btn_get_value = tk.Button(
     command=get_value
 )
 btn_get_value.pack(pady=6)
+
+btn_ignitar = tk.Button(
+    frame_config, text="IGNITAR", width=15,
+    bg="red", fg="white",
+    font=("Arial", 12, "bold"),
+    command=iniciar_ignitar
+)
+btn_ignitar.pack(pady=8)
 
 fig, (ax_presion, ax_n, ax_temperatura) = plt.subplots(3, 1, figsize=(6, 8))
 canvas = FigureCanvasTkAgg(fig, master=frame_graficas)
