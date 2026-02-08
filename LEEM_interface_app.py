@@ -150,6 +150,7 @@ def get_value():  # obtenemos una tanda de valor de los sensores para verificar 
         messagebox.showwarning("Aviso", "Puerto no conectado")
         return
 
+    ser.reset_input_buffer()  # Limpiar buffer antes de solicitar datos
     ser.write(bytes([0x01])) # Comando para solicitar datos de sensores
 
 def ignitar():
@@ -179,16 +180,18 @@ def cuenta_regresiva(segundos):
         ignition_countdown = False
         # Enviar comando directamente aquí
         try:
-            ser.write(COMANDO_IGNICION)
-            print("Comando 0x04 enviado por el puerto serie")
-            # Activar medición automáticamente
-            medicion_activa = True
-            # Limpiar datos anteriores
+            # Limpiar datos anteriores y buffer
             tiempos.clear()
             presiones.clear()
             ns.clear()
             temperaturas.clear()
             tiempo_base = None
+            ser.reset_input_buffer()
+            
+            ser.write(COMANDO_IGNICION)
+            print("Comando 0x04 enviado por el puerto serie")
+            # Activar medición automáticamente
+            medicion_activa = True
             estado_medicion.config(text="Medición: ACTIVA", fg="green")
             btn_start_stop.config(text="STOP", bg="orange")
             valor_label.config(
@@ -232,7 +235,12 @@ def refrescar_puertos():
 def leer_datos():
     global ignitar_flag, tiempo_base, contador_paquetes, ultimo_calculo_hz, hz_actual
     with open(archivo_salida, 'w') as archivo:
-        archivo.write(f"{'Presion':>12} {'Temp':>8} {'Tiempo_s':>10}\n")
+        # Header con todas las columnas
+        header = f"{'Timestamp_ms':>13} {'Tiempo_s':>10} {'Thrust_N':>12}"
+        for i in range(1, 11):
+            header += f" {'Tp'+str(i)+'_C':>10}"
+        header += f" {'Transducer':>12}\n"
+        archivo.write(header)
 
         while leyendo:
             encabezado = ser.read(1)
@@ -252,62 +260,69 @@ def leer_datos():
                     ultimo_calculo_hz = ahora
                 
                 contador_paquetes += 1
-                payload = ser.read(24)
-                if len(payload) != 24:
+                # Nueva estructura: 4 (timestamp) + 2 (thrust) + 20 (10 temps) + 2 (transducer) = 28 bytes
+                payload = ser.read(28)
+                if len(payload) != 28:
+                    ser.reset_input_buffer()  # Limpiar buffer si payload incompleto
                     continue
 
-                valores = struct.unpack(">12H", payload)
+                # Desempaquetar: 1 uint32, 1 int16, 10 int16, 1 uint16
+                # Formato little-endian (nativo de ARM/Arduino)
+                timestamp_ms = struct.unpack("<I", payload[0:4])[0]
+                thrust_raw = struct.unpack("<h", payload[4:6])[0]
+                thrust = thrust_raw / 100.0  # Dividir por 100 para obtener valor real
+                
+                # 10 temperaturas (multiplicadas por 100)
+                temps = []
                 for i in range(10):
-                    tabla_valores[i].set(f"Tp{i + 1}: {valores[i]}")
+                    temp_raw = struct.unpack("<h", payload[6 + i*2:8 + i*2])[0]
+                    temps.append(temp_raw / 100.0)
+                
+                transducer_raw = struct.unpack("<H", payload[26:28])[0]
+                
+                # Actualizar interfaz
+                for i in range(10):
+                    tabla_valores[i].set(f"Tp{i + 1}: {temps[i]:.2f}°C")
 
-                ps_var.set(f"Ps: {valores[10]}")
-                n_var.set(f"N: {valores[11]}")
+                ps_var.set(f"Thrust: {thrust:.2f} N")
+                n_var.set(f"Transducer: {transducer_raw}")
+                timestamp_var.set(f"Timestamp: {timestamp_ms} ms")
 
                 # Solo graficar cuando la medición está activa
                 if medicion_activa:
                     if tiempo_base is None:
                         tiempo_base = time.time()
                     tiempo_s = time.time() - tiempo_base
-                    tp_promedio = sum(valores[:10]) / 10.0
+                    tp_promedio = sum(temps) / 10.0
                     
                     # Mostrar valores actuales si no hay cuenta regresiva
                     if not ignition_countdown:
                         valor_label.config(
-                            text=f"P: {valores[10]} | T: {tp_promedio:.1f} | t: {tiempo_s:.2f}s",
+                            text=f"Thrust: {thrust:.2f} N | T: {tp_promedio:.1f}°C | t: {tiempo_s:.2f}s",
                             font=("Arial", 12),
                             fg="black"
                         )
                     
+                    # Guardar datos en archivo con todas las temperaturas individuales
+                    linea = f"{timestamp_ms:13} {tiempo_s:10.3f} {thrust:12.3f}"
+                    for temp in temps:
+                        linea += f" {temp:10.3f}"
+                    linea += f" {transducer_raw:12}\n"
+                    archivo.write(linea)
+                    archivo.flush()
+                    
                     tiempos.append(tiempo_s)
-                    presiones.append(valores[10])
-                    ns.append(valores[11])
+                    presiones.append(thrust)  # Ahora es thrust en lugar de presión
+                    ns.append(transducer_raw)
                     temperaturas.append(tp_promedio)
+                
+                # Limpiar buffer después de procesar exitosamente
+                ser.reset_input_buffer()
                 continue
 
-            if not medicion_activa:
-                time.sleep(0.05)
-                continue
-
-            datos = encabezado + ser.read(BYTES_POR_PAQUETE - 1)
-            if len(datos) != BYTES_POR_PAQUETE:
-                continue
-
-            presion, temperatura, tiempo_ms = struct.unpack(">ffI", datos)
-            tiempo_s = tiempo_ms / 1000.0
-
-            if not ignition_countdown:
-                valor_label.config(
-                    text=f"P: {presion:.2f} | T: {temperatura:.2f} | t: {tiempo_s:.2f}s",
-                    font=("Arial", 12),
-                    fg="black"
-                )
-
-            archivo.write(f"{presion:12.3f} {temperatura:8.3f} {tiempo_s:10.3f}\n")
-            archivo.flush()
-
-            tiempos.append(tiempo_s)
-            presiones.append(presion)
-            temperaturas.append(temperatura)
+            # Si no es 0x01, limpiar buffer y esperar
+            ser.reset_input_buffer()
+            time.sleep(0.01)
 
 # ---------- GRÁFICAS ----------
 def actualizar_graficas():
@@ -317,13 +332,13 @@ def actualizar_graficas():
             ax_n.clear()
             ax_temperatura.clear()
 
-            ax_presion.plot(tiempos, presiones, color="blue", label="Presión")
-            ax_presion.set_ylabel("Presión [Pa]")
+            ax_presion.plot(tiempos, presiones, color="blue", label="Thrust")
+            ax_presion.set_ylabel("Thrust [N]")
             ax_presion.grid(True)
             ax_presion.legend()
 
-            ax_n.plot(tiempos, ns, color="green", label="N")
-            ax_n.set_ylabel("N")
+            ax_n.plot(tiempos, ns, color="green", label="Transducer")
+            ax_n.set_ylabel("Transducer [raw]")
             ax_n.grid(True)
             ax_n.legend()
 
@@ -450,6 +465,11 @@ ps_lbl.grid(row=5, column=0, padx=4, pady=6, sticky="w")
 n_var = tk.StringVar(value="N: 0.00")
 n_lbl = tk.Label(frame_tabla, textvariable=n_var, width=16, anchor="w", font=("Arial", 12, "bold"))
 n_lbl.grid(row=5, column=1, padx=4, pady=6, sticky="w")
+
+# Timestamp
+timestamp_var = tk.StringVar(value="Timestamp: 0 ms")
+timestamp_lbl = tk.Label(frame_tabla, textvariable=timestamp_var, width=34, anchor="w", font=("Arial", 10, "bold"), fg="blue")
+timestamp_lbl.grid(row=6, column=0, columnspan=2, padx=4, pady=6, sticky="w")
 
 ventana.protocol("WM_DELETE_WINDOW", cerrar)
 ventana.after(1000, refrescar_puertos)
