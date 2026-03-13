@@ -60,7 +60,6 @@ def conectar():
 
         leyendo = True
 
-        # Clear queue from previous session
         while not data_queue.empty():
             try:
                 data_queue.get_nowait()
@@ -169,8 +168,20 @@ def ignitar():
     cuenta_regresiva(10)
 
 
+def cancelar_ignicion():
+    global ignition_countdown
+    if ignition_countdown:
+        ignition_countdown = False
+        # El label se actualiza en el siguiente tick de cuenta_regresiva
+
+
 def cuenta_regresiva(segundos):
     global ignition_countdown, medicion_activa, tiempo_base
+
+    if not ignition_countdown:
+        valor_label.config(text="Ignición cancelada",
+                           font=("Arial", 16, "bold"), fg="orange")
+        return
 
     if segundos >= 0:
         valor_label.config(text=f"IGNICIÓN EN {segundos} s",
@@ -224,8 +235,6 @@ def refrescar_puertos():
 
 
 # ---------- LECTURA SERIAL (hilo) ----------
-# This thread does ZERO tkinter calls.
-# It only reads bytes, unpacks structs, and puts dicts into data_queue.
 def leer_datos():
     global contador_paquetes, ultimo_calculo_hz, hz_actual
 
@@ -237,7 +246,6 @@ def leer_datos():
             break
 
         if len(b) != 1 or b != b"\x01":
-            # Not a sync byte — keep scanning, no flush, no sleep
             continue
 
         try:
@@ -247,10 +255,8 @@ def leer_datos():
             break
 
         if len(payload) != 28:
-            # Incomplete — skip without flushing
             continue
 
-        # Hz bookkeeping (pure Python, no tkinter)
         ahora = time.time()
         if ultimo_calculo_hz is None:
             ultimo_calculo_hz = ahora
@@ -261,11 +267,10 @@ def leer_datos():
             contador_paquetes = 0
             ultimo_calculo_hz = ahora
 
-        # Unpack: uint32 + int16 + 10×int16 + uint16
         timestamp_ms   = struct.unpack("<I", payload[0:4])[0]
-        thrust         = struct.unpack("<h", payload[4:6])[0] / 100.0
-        temps          = [struct.unpack("<h", payload[6 + i*2 : 8 + i*2])[0] / 100.0
-                          for i in range(10)]
+        thrust         = struct.unpack("<i", payload[4:8])[0] / 100.0
+        temps          = [struct.unpack("<h", payload[8 + i*2 : 10 + i*2])[0] / 100.0
+                          for i in range(9)]
         transducer_raw = struct.unpack("<H", payload[26:28])[0]
 
         paquete = {
@@ -275,19 +280,18 @@ def leer_datos():
             "temps":        temps,
             "transducer":   transducer_raw,
             "hz":           hz_actual,
-            "ts":           time.time(),  # wall time for plotting
+            "ts":           time.time(),
         }
 
         try:
             data_queue.put_nowait(paquete)
         except:
-            pass  # queue full → GUI is behind, silently drop
+            pass
 
 
 # ---------- QUEUE DRAIN (main thread) ----------
-# Runs on the main thread every 20 ms.
-# All tkinter/widget updates happen here — fully thread-safe.
 _archivo = None
+
 
 def procesar_queue():
     global tiempo_base, medicion_activa, _archivo
@@ -295,17 +299,16 @@ def procesar_queue():
     if not leyendo:
         return
 
-    # Lazily open/reuse output file
     if _archivo is None or _archivo.closed:
         _archivo = open(archivo_salida, 'w')
         header = f"{'Timestamp_ms':>13} {'Tiempo_s':>10} {'Thrust_N':>12}"
-        for i in range(1, 11):
+        for i in range(1, 10):
             header += f" {'Tp'+str(i)+'_C':>10}"
         header += f" {'Transducer':>12}\n"
         _archivo.write(header)
 
     procesados = 0
-    while procesados < 20:   # drain up to 20 packets per 20 ms tick → handles 1000 Hz headroom
+    while procesados < 20:
         try:
             paquete = data_queue.get_nowait()
         except Empty:
@@ -321,8 +324,7 @@ def procesar_queue():
         timestamp_ms = paquete["timestamp_ms"]
         hz           = paquete["hz"]
 
-        # --- Safe tkinter updates ---
-        for i in range(10):
+        for i in range(9):
             tabla_valores[i].set(f"Tp{i+1}: {temps[i]:.2f}°C")
         ps_var.set(f"Thrust: {thrust:.2f} N")
         n_var.set(f"Transducer: {transducer}")
@@ -334,7 +336,7 @@ def procesar_queue():
             if tiempo_base is None:
                 tiempo_base = paquete["ts"]
             tiempo_s    = paquete["ts"] - tiempo_base
-            tp_promedio = sum(temps) / 10.0
+            tp_promedio = sum(temps) / 9.0
 
             if not ignition_countdown:
                 valor_label.config(
@@ -412,10 +414,12 @@ try:
 except tk.TclError:
     pass
 
-style.configure("Main.TButton", foreground="white", background="#C88A53", padding=10)
-style.map("Main.TButton", background=[("active", "#D89A63")])
-style.configure("Side.TFrame",  background="#2C2A36")
-style.configure("Right.TFrame", background="#15141B")
+style.configure("Main.TButton",   foreground="white", background="#C88A53", padding=10)
+style.map("Main.TButton",         background=[("active", "#D89A63")])
+style.configure("Cancel.TButton", foreground="white", background="#8B2020", padding=10)
+style.map("Cancel.TButton",       background=[("active", "#A83030")])
+style.configure("Side.TFrame",    background="#2C2A36")
+style.configure("Right.TFrame",   background="#15141B")
 
 frame_config = ttk.Frame(ventana, width=240, style="Side.TFrame")
 frame_config.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
@@ -431,7 +435,7 @@ frame_tabla = ttk.Frame(frame_right, style="Side.TFrame")
 frame_tabla.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=10)
 
 # Controls
-tk.Label(frame_config, text="Puerto COM",       bg="#2C2A36", fg="white").pack(anchor="w", pady=2)
+tk.Label(frame_config, text="Puerto COM",        bg="#2C2A36", fg="white").pack(anchor="w", pady=2)
 puerto_var       = tk.StringVar()
 puertos_actuales = obtener_puertos()
 puerto_var.set(puertos_actuales[0] if puertos_actuales else "No hay puertos")
@@ -439,7 +443,7 @@ puerto_menu = tk.OptionMenu(frame_config, puerto_var,
                             *(puertos_actuales if puertos_actuales else ["No hay puertos"]))
 puerto_menu.pack(fill="x")
 
-tk.Label(frame_config, text="Baudrate",         bg="#2C2A36", fg="white").pack(anchor="w", pady=2)
+tk.Label(frame_config, text="Baudrate",          bg="#2C2A36", fg="white").pack(anchor="w", pady=2)
 baudrate_var = tk.StringVar(value="115200")
 tk.Entry(frame_config, textvariable=baudrate_var, bg="#3C3A46", fg="white",
          insertbackground="white").pack(fill="x", ipady=2)
@@ -449,26 +453,28 @@ archivo_var = tk.StringVar(value="datos.txt")
 tk.Entry(frame_config, textvariable=archivo_var, bg="#3C3A46", fg="white",
          insertbackground="white").pack(fill="x", ipady=2)
 
-estado_label    = tk.Label(frame_config, text="Estado: Desconectado", fg="red",     bg="#2C2A36")
+estado_label    = tk.Label(frame_config, text="Estado: Desconectado", fg="red",   bg="#2C2A36")
 estado_label.pack(pady=5)
-estado_medicion = tk.Label(frame_config, text="Medición: DETENIDA",   fg="red",     bg="#2C2A36")
+estado_medicion = tk.Label(frame_config, text="Medición: DETENIDA",   fg="red",   bg="#2C2A36")
 estado_medicion.pack(pady=5)
-hz_label        = tk.Label(frame_config, text="Frecuencia: 0.0 Hz",   fg="white",   bg="#2C2A36")
+hz_label        = tk.Label(frame_config, text="Frecuencia: 0.0 Hz",   fg="white", bg="#2C2A36")
 hz_label.pack(pady=5)
-valor_label     = tk.Label(frame_config, text="Valor: ---",            fg="white",   bg="#2C2A36")
+valor_label     = tk.Label(frame_config, text="Valor: ---",            fg="white", bg="#2C2A36")
 valor_label.pack(pady=10)
 
-btn_conectar    = ttk.Button(frame_config, text="Conectar",    width=15, command=conectar,        style="Main.TButton")
+btn_conectar    = ttk.Button(frame_config, text="Conectar",            width=15, command=conectar,           style="Main.TButton")
 btn_conectar.pack(pady=3)
-btn_desconectar = ttk.Button(frame_config, text="Desconectar", width=15, command=desconectar,     style="Main.TButton")
+btn_desconectar = ttk.Button(frame_config, text="Desconectar",         width=15, command=desconectar,        style="Main.TButton")
 btn_desconectar.pack(pady=3)
 btn_desconectar.config(state="disabled")
-btn_start_stop  = ttk.Button(frame_config, text="START",       width=18, command=toggle_medicion, style="Main.TButton")
+btn_start_stop  = ttk.Button(frame_config, text="START",               width=18, command=toggle_medicion,    style="Main.TButton")
 btn_start_stop.pack(pady=8)
-btn_get_value   = ttk.Button(frame_config, text="GET VALUE",   width=18, command=get_value,       style="Main.TButton")
+btn_get_value   = ttk.Button(frame_config, text="GET VALUE",           width=18, command=get_value,          style="Main.TButton")
 btn_get_value.pack(pady=6)
-btn_ignitar     = ttk.Button(frame_config, text="IGNITAR",     width=18, command=ignitar,         style="Main.TButton")
+btn_ignitar     = ttk.Button(frame_config, text="IGNITAR",             width=18, command=ignitar,            style="Main.TButton")
 btn_ignitar.pack(pady=8)
+btn_cancel_ign  = ttk.Button(frame_config, text="CANCELAR IGNICIÓN",   width=18, command=cancelar_ignicion,  style="Cancel.TButton")
+btn_cancel_ign.pack(pady=4)
 
 # Plots
 fig, (ax_presion, ax_n, ax_temperatura) = plt.subplots(3, 1, figsize=(6, 8))
@@ -476,9 +482,9 @@ fig.patch.set_facecolor("#5F5A7A")
 canvas = FigureCanvasTkAgg(fig, master=frame_graficas)
 canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-# Sensor table
+# Sensor table — 9 termopares: 5 en col 0, 4 en col 1
 tabla_valores = []
-for i in range(10):
+for i in range(9):
     var  = tk.StringVar(value=f"Tp{i+1}: 0.00")
     fila = i % 5
     col  = i // 5

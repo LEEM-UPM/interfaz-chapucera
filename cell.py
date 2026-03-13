@@ -3,42 +3,51 @@ import serial.tools.list_ports
 import time
 import threading
 import tkinter as tk
-from tkinter import messagebox
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 from collections import deque
 from queue import Queue, Empty
 import struct
-import sys
 import csv
 import os
 
 
-
 # ---------- CONFIGURACIÓN ----------
-TIMEOUT     = 1
-MAX_PUNTOS  = 500
-SYNC1       = 0x01
-PACKET_SIZE = 28
-CSV_FILE    = "calibracion.csv"
-# ----------------------------------
+TIMEOUT        = 1
+MAX_PUNTOS     = 500
+SYNC1          = 0xFE
+SYNC2          = 0xFB
+PACKET_SIZE    = 30
+CSV_FILE       = "calibracion.csv"
+GRAPH_INTERVAL = 100
+QUEUE_INTERVAL = 10
+# -----------------------------------
 
 
-
-# ---------- VARIABLES GLOBALES ----------
 ser           = None
 leyendo       = False
 tiempo_inicio = None
-data_queue    = Queue(maxsize=500)
+data_queue    = Queue(maxsize=2000)
+
 
 tiempos_thrust = deque(maxlen=MAX_PUNTOS)
 valores_thrust = deque(maxlen=MAX_PUNTOS)
 ultimos_1000   = deque(maxlen=1000)
-# ----------------------------------------
 
 
+_line      = None
+_avg_line  = None
+_graf_init = False
 
-# ---------- BOTÓN COMPATIBLE CON MACOS ----------
+
+# ── inline feedback (replaces all messageboxes) ──────────────────────────────
+def _flash_msg(text, color="#00FF88", duration=3000):
+    """Show a temporary status message in the sidebar, no popup."""
+    notify_label.config(text=text, fg=color)
+    ventana.after(duration, lambda: notify_label.config(text=""))
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def make_button(parent, text, command, bg="#C88A53", fg="white",
                 font=("Arial", 10, "bold"), state="normal"):
     frame = tk.Frame(parent, bg=bg, cursor="hand2")
@@ -47,49 +56,38 @@ def make_button(parent, text, command, bg="#C88A53", fg="white",
     label.pack(fill="both")
 
     def _on_click(e):
-        if frame._enabled:
-            command()
+        if frame._enabled: command()
 
     def _on_enter(e):
         if frame._enabled:
             r, g, b_ = ventana.winfo_rgb(bg)
             lighter = "#{:02x}{:02x}{:02x}".format(
-                min(255, (r >> 8) + 25),
-                min(255, (g >> 8) + 25),
-                min(255, (b_ >> 8) + 25))
-            frame.config(bg=lighter)
-            label.config(bg=lighter)
+                min(255, (r >> 8) + 25), min(255, (g >> 8) + 25), min(255, (b_ >> 8) + 25))
+            frame.config(bg=lighter); label.config(bg=lighter)
 
     def _on_leave(e):
         c = bg if frame._enabled else "#555555"
-        frame.config(bg=c)
-        label.config(bg=c)
+        frame.config(bg=c); label.config(bg=c)
 
     def _set_state(s):
         frame._enabled = (s == "normal")
-        c   = bg      if frame._enabled else "#555555"
-        fg_ = fg      if frame._enabled else "#888888"
+        c   = bg    if frame._enabled else "#555555"
+        fg_ = fg    if frame._enabled else "#888888"
         cur = "hand2" if frame._enabled else "arrow"
-        frame.config(bg=c, cursor=cur)
-        label.config(bg=c, fg=fg_, cursor=cur)
+        frame.config(bg=c, cursor=cur); label.config(bg=c, fg=fg_, cursor=cur)
 
     frame._enabled = True
     frame.config   = lambda **kw: (_set_state(kw["state"]) if "state" in kw else None)
-
     for widget in (frame, label):
         widget.bind("<Button-1>", _on_click)
         widget.bind("<Enter>",    _on_enter)
         widget.bind("<Leave>",    _on_leave)
-
     _set_state(state)
     return frame
-# ------------------------------------------------
-
 
 
 def obtener_puertos():
     return [p.device for p in serial.tools.list_ports.comports()]
-
 
 
 def refrescar_puertos():
@@ -111,9 +109,8 @@ def refrescar_puertos():
     ventana.after(1000, refrescar_puertos)
 
 
-
 def conectar():
-    global ser, leyendo, tiempo_inicio
+    global ser, leyendo, tiempo_inicio, _graf_init
 
     puerto = puerto_var.get()
     if puerto == "No hay puertos":
@@ -125,92 +122,93 @@ def conectar():
 
         leyendo       = True
         tiempo_inicio = time.time()
+        _graf_init    = False
 
         tiempos_thrust.clear()
         valores_thrust.clear()
         ultimos_1000.clear()
 
         while not data_queue.empty():
-            try:
-                data_queue.get_nowait()
-            except Empty:
-                break
+            try: data_queue.get_nowait()
+            except Empty: break
 
         threading.Thread(target=leer_datos, daemon=True).start()
-        ventana.after(20,   procesar_queue)
-        ventana.after(1000, actualizar_grafica)
+        ventana.after(QUEUE_INTERVAL,  procesar_queue)
+        ventana.after(GRAPH_INTERVAL,  actualizar_grafica)
 
         estado_label.config(text="Conectado", fg="#00FF88")
         btn_conectar.config(state="disabled")
         btn_desconectar.config(state="normal")
 
     except Exception as e:
-        estado_label.config(text=f"Error: {e}", fg="red")
-
+        _flash_msg(f"Error: {e}", color="red", duration=5000)
 
 
 def desconectar():
     global ser, leyendo
 
     leyendo = False
-
     if ser and ser.is_open:
-        try:
-            ser.close()
-        except:
-            pass
+        try: ser.close()        # closing the port unblocks ser.read() immediately
+        except: pass
     ser = None
 
     estado_label.config(text="Desconectado", fg="red")
     thrust_label.config(text="-- N")
     avg_label.config(text="Prom(1000): -- N")
+    ts_label.config(text="--:--.--.---")
     btn_conectar.config(state="normal")
     btn_desconectar.config(state="disabled")
-
 
 
 def leer_datos():
     global leyendo
 
     while leyendo:
-        # Wait for first sync byte
         try:
             b = ser.read(1)
         except (serial.SerialException, OSError):
-            data_queue.put({"tipo": "error"})
-            break
+            data_queue.put({"tipo": "error"}); break
 
         if len(b) != 1 or b[0] != SYNC1:
             continue
 
-        # Wait for second sync byte
+        try:
+            b2 = ser.read(1)
+        except (serial.SerialException, OSError):
+            data_queue.put({"tipo": "error"}); break
 
-        # Read payload
+        if len(b2) != 1 or b2[0] != SYNC2:
+            continue
+
         try:
             payload = ser.read(PACKET_SIZE)
         except (serial.SerialException, OSError):
-            data_queue.put({"tipo": "error"})
-            break
+            data_queue.put({"tipo": "error"}); break
 
         if len(payload) != PACKET_SIZE:
             continue
 
-        thrust = struct.unpack("<h", payload[4:6])[0] / 100.0
-        ts     = time.time()
+        thrust    = struct.unpack("<i", payload[4:8])[0] / 100.0
+        teensy_ms = struct.unpack("<I", payload[0:4])[0]
+        ts        = time.time()
 
         try:
-            data_queue.put_nowait({"tipo": "datos", "thrust": thrust, "ts": ts})
+            data_queue.put_nowait({"tipo": "datos", "thrust": thrust,
+                                   "ts": ts, "teensy_ms": teensy_ms})
         except:
             pass
-
 
 
 def procesar_queue():
     if not leyendo:
         return
 
-    procesados = 0
-    while procesados < 20:
+    procesados  = 0
+    last_thrust = None
+    last_tms    = None
+
+    while procesados < 50:
         try:
             paquete = data_queue.get_nowait()
         except Empty:
@@ -226,29 +224,82 @@ def procesar_queue():
         tiempos_thrust.append(t_rel)
         valores_thrust.append(thrust)
         ultimos_1000.append(thrust)
+        last_thrust = thrust
+        last_tms    = paquete.get("teensy_ms", 0)
+        procesados += 1
 
-        thrust_label.config(text=f"{thrust:.2f} N")
+    if last_thrust is not None:
+        thrust_label.config(text=f"{last_thrust:.2f} N")
 
         n = len(ultimos_1000)
         if n > 0:
             avg = sum(ultimos_1000) / n
             avg_label.config(text=f"Prom({n}/1000): {avg:.2f} N")
 
-        procesados += 1
+        ms  =  last_tms % 1000
+        sec = (last_tms // 1000) % 60
+        mn  = (last_tms // 60000) % 60
+        hr  = (last_tms // 3600000) % 24
+        ts_label.config(text=f"{hr:02d}:{mn:02d}:{sec:02d}.{ms:03d}")
 
-    ventana.after(20, procesar_queue)
+    ventana.after(QUEUE_INTERVAL, procesar_queue)
 
+
+def _init_grafica():
+    global _line, _avg_line, _graf_init
+
+    ax.set_facecolor("#2C2A36")
+    ax.set_ylabel("Thrust [N]",          color="white")
+    ax.set_xlabel("Tiempo [s]",           color="white")
+    ax.set_title("Thrust en tiempo real", color="white")
+    ax.tick_params(colors="white")
+    for spine in ax.spines.values():
+        spine.set_color('#555555')
+    ax.grid(True, color="#444444")
+
+    _line,    = ax.plot([], [], color="#C88A53", linewidth=2, label="Thrust")
+    _avg_line = ax.axhline(0, color="#00FF88", linewidth=1.4,
+                           linestyle="--", label="Prom(1000)")
+    ax.legend(facecolor="#2C2A36", labelcolor="white", fontsize=9)
+    fig.tight_layout()
+    _graf_init = True
+
+
+def actualizar_grafica():
+    global _graf_init
+
+    if not leyendo:
+        return
+
+    if len(tiempos_thrust) >= 2:
+        if not _graf_init:
+            _init_grafica()
+
+        t   = list(tiempos_thrust)
+        th  = list(valores_thrust)
+        avg = sum(ultimos_1000) / len(ultimos_1000) if ultimos_1000 else 0.0
+
+        _line.set_data(t, th)
+        _avg_line.set_ydata([avg, avg])
+
+        ax.relim()
+        ax.autoscale_view()
+        ax.get_legend().get_texts()[1].set_text(f"Prom(1000): {avg:.2f} N")
+
+        canvas.draw_idle()
+
+    ventana.after(GRAPH_INTERVAL, actualizar_grafica)
 
 
 def guardar_punto():
     if not ultimos_1000:
-        messagebox.showwarning("Sin datos", "Todavía no hay datos suficientes.")
+        _flash_msg("Sin datos aún", color="red")
         return
 
     try:
         peso_kg = float(peso_var.get())
     except ValueError:
-        messagebox.showerror("Error", "Introduce un peso válido en kg.")
+        _flash_msg("Peso inválido", color="red")
         return
 
     n     = len(ultimos_1000)
@@ -262,56 +313,27 @@ def guardar_punto():
             writer.writerow(["timestamp", "peso_kg", "thrust_prom_N", "n_muestras"])
         writer.writerow([ts, peso_kg, f"{avg_N:.4f}", n])
 
-    messagebox.showinfo(
-        "Guardado",
-        f"Punto guardado:\n  Peso: {peso_kg} kg\n  Thrust prom: {avg_N:.2f} N\n  Muestras: {n}"
-    )
-
-
-
-def actualizar_grafica():
-    if not leyendo:
-        return
-
-    if len(tiempos_thrust) >= 2:
-        t   = list(tiempos_thrust)
-        th  = list(valores_thrust)
-        avg = sum(ultimos_1000) / len(ultimos_1000) if ultimos_1000 else 0.0
-
-        ax.clear()
-        ax.plot(t, th, color="#C88A53", linewidth=2, label="Thrust")
-        ax.axhline(avg, color="#00FF88", linewidth=1.4,
-                   linestyle="--", label=f"Prom(1000): {avg:.2f} N")
-
-        ax.set_ylabel("Thrust [N]",          color="white")
-        ax.set_xlabel("Tiempo [s]",           color="white")
-        ax.set_title("Thrust en tiempo real", color="white")
-        ax.tick_params(colors="white")
-        ax.spines['bottom'].set_color('#555555')
-        ax.spines['top'].set_color('#555555')
-        ax.spines['left'].set_color('#555555')
-        ax.spines['right'].set_color('#555555')
-        ax.set_facecolor("#2C2A36")
-        ax.grid(True, color="#444444")
-        ax.legend(facecolor="#2C2A36", labelcolor="white", fontsize=9)
-        fig.tight_layout()
-        canvas.draw()
-
-    ventana.after(1000, actualizar_grafica)
-
+    _flash_msg(f"✔ {peso_kg} kg → {avg_N:.2f} N  ({n} muestras)")
 
 
 def cerrar():
-    desconectar()
-    ventana.destroy()
-    sys.exit()
+    global leyendo
+    leyendo = False
+    if ser and ser.is_open:
+        try: ser.close()        # unblocks any pending ser.read() in the thread
+        except: pass
+    ventana.after(200, _destruir)
 
+
+def _destruir():
+    try: ventana.destroy()
+    except: pass
 
 
 # ---------------- INTERFAZ ----------------
 ventana = tk.Tk()
 ventana.title("Thrust Calibration")
-ventana.geometry("700x520")
+ventana.geometry("700x540")
 ventana.configure(bg="#15141B")
 
 frame_left = tk.Frame(ventana, bg="#2C2A36", width=180)
@@ -343,7 +365,11 @@ thrust_label.pack(pady=(10, 2))
 
 avg_label = tk.Label(frame_left, text="Prom(1000): -- N", fg="#00FF88",
                      bg="#2C2A36", font=("Arial", 11, "bold"))
-avg_label.pack(pady=(0, 15))
+avg_label.pack(pady=(0, 4))
+
+ts_label = tk.Label(frame_left, text="--:--:--.---", fg="#888888",
+                    bg="#2C2A36", font=("Courier New", 11))
+ts_label.pack(pady=(0, 12))
 
 tk.Frame(frame_left, height=2, bg="#555555").pack(fill="x", pady=5)
 
@@ -355,7 +381,13 @@ tk.Entry(frame_left, textvariable=peso_var, bg="#3C3A46", fg="white",
 
 btn_guardar = make_button(frame_left, "💾 Guardar punto", guardar_punto,
                           bg="#4A90D9", fg="white", font=("Arial", 10, "bold"))
-btn_guardar.pack(pady=8, fill="x", padx=5)
+btn_guardar.pack(pady=(8, 2), fill="x", padx=5)
+
+# ── inline notification label (no more popups) ───────────────────────────────
+notify_label = tk.Label(frame_left, text="", bg="#2C2A36",
+                        font=("Arial", 9, "bold"), wraplength=160, justify="center")
+notify_label.pack(pady=(2, 6), padx=5)
+# ─────────────────────────────────────────────────────────────────────────────
 
 tk.Frame(frame_left, height=2, bg="#555555").pack(fill="x", pady=5)
 
