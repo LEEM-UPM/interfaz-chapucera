@@ -269,6 +269,14 @@ def leer_datos():
 
         timestamp_ms   = struct.unpack("<I", payload[0:4])[0]
         thrust         = struct.unpack("<i", payload[4:8])[0] / 100.0
+        
+        thrust = thrust*3.3/2**12 #Temas de resolución
+        
+        thrust = (thrust/150-4e-3)*5000/16e-3 #PSI
+        
+        thrust = thrust*6.89476e-3 #Convertir PSI a bar
+        
+        
         temps          = [struct.unpack("<h", payload[8 + i*2 : 10 + i*2])[0] / 100.0
                           for i in range(9)]
         transducer_raw = struct.unpack("<H", payload[26:28])[0]
