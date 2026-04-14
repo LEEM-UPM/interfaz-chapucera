@@ -274,11 +274,12 @@ def leer_datos():
         temps          = [struct.unpack("<h", payload[8 + i*2 : 10 + i*2])[0] / 100.0
                           for i in range(9)]
         transducer_raw = struct.unpack("<H", payload[26:28])[0]
-        transducer_raw = transducer_raw*3.3/2**12 #Temas de resolución
+        transducer_raw = (transducer_raw/4095)/3.3
         
-        transducer_raw = (transducer_raw/150-4e-3)*5000/16e-3 #PSI
+        transducer_raw = (transducer_raw/150 - 0.004) * 312500
         
-        transducer_raw = transducer_raw*6.89476e-3+1.01325 #Convertir PSI a bar y sumamos presión atmosférica pq el sensor mide desde vacío, no desde atmósfera
+        transducer_raw = (transducer_raw*0.0689476) + 1.01325
+
         paquete = {
             "tipo":         "datos",
             "timestamp_ms": timestamp_ms,
