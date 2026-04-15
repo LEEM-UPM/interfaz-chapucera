@@ -172,7 +172,6 @@ def cancelar_ignicion():
     global ignition_countdown
     if ignition_countdown:
         ignition_countdown = False
-        # El label se actualiza en el siguiente tick de cuenta_regresiva
 
 
 def cuenta_regresiva(segundos):
@@ -235,6 +234,13 @@ def refrescar_puertos():
 
 
 # ---------- LECTURA SERIAL (hilo) ----------
+# Paquete de 27 bytes:
+#   [0:4]   timestamp_ms  (uint32 LE)
+#   [4:8]   thrust        (int32  LE) / 100.0
+#   [8:24]  temps x8      (int16  LE cada uno) / 100.0   (8 * 2 = 16 bytes)
+#   [24:26] transducer    (uint16 LE)
+# Total payload = 26 bytes  (+ 1 byte cabecera 0x01 = 27 bytes por paquete)
+
 def leer_datos():
     global contador_paquetes, ultimo_calculo_hz, hz_actual
 
@@ -249,12 +255,12 @@ def leer_datos():
             continue
 
         try:
-            payload = ser.read(28)
+            payload = ser.read(26)
         except (serial.SerialException, OSError):
             data_queue.put({"tipo": "error"})
             break
 
-        if len(payload) != 28:
+        if len(payload) != 26:
             continue
 
         ahora = time.time()
@@ -269,16 +275,15 @@ def leer_datos():
 
         timestamp_ms   = struct.unpack("<I", payload[0:4])[0]
         thrust         = struct.unpack("<i", payload[4:8])[0] / 100.0
-        
-        
+
+        # 8 termopares: bytes [8:24]
         temps          = [struct.unpack("<h", payload[8 + i*2 : 10 + i*2])[0] / 100.0
-                          for i in range(9)]
-        transducer_raw = struct.unpack("<H", payload[26:28])[0]
-        transducer_raw = (transducer_raw/4095)/3.3
-        
-        transducer_raw = (transducer_raw/150 - 0.004) * 312500
-        
-        transducer_raw = (transducer_raw*0.0689476) + 1.01325
+                          for i in range(8)]
+
+        transducer_raw = struct.unpack("<H", payload[24:26])[0]
+        transducer_raw = (transducer_raw / 4095) / 3.3
+        transducer_raw = (transducer_raw / 150 - 0.004) * 312500
+        transducer_raw = (transducer_raw * 0.0689476) + 1.01325
 
         paquete = {
             "tipo":         "datos",
@@ -308,10 +313,11 @@ def procesar_queue():
 
     if _archivo is None or _archivo.closed:
         _archivo = open(archivo_salida, 'w')
-        header = f"{'Timestamp_ms':>13} {'Tiempo_s':>10} {'Thrust_N':>12}"
-        for i in range(1, 10):
-            header += f" {'Tp'+str(i)+'_C':>10}"
-        header += f" {'Transducer':>12}\n"
+        # Cabecera CSV
+        header = "Timestamp_ms,Tiempo_s,Thrust_N"
+        for i in range(1, 9):
+            header += f",Tp{i}_C"
+        header += ",Pressure\n"
         _archivo.write(header)
 
     procesados = 0
@@ -331,10 +337,10 @@ def procesar_queue():
         timestamp_ms = paquete["timestamp_ms"]
         hz           = paquete["hz"]
 
-        for i in range(9):
+        for i in range(8):
             tabla_valores[i].set(f"Tp{i+1}: {temps[i]:.2f}°C")
         ps_var.set(f"Thrust: {thrust:.2f} N")
-        n_var.set(f"Transducer: {transducer}")
+        n_var.set(f"Pressure: {transducer:.4f} bar")
         timestamp_var.set(f"Timestamp: {timestamp_ms} ms")
         if hz > 0:
             hz_label.config(text=f"Frecuencia: {hz:.1f} Hz")
@@ -343,7 +349,7 @@ def procesar_queue():
             if tiempo_base is None:
                 tiempo_base = paquete["ts"]
             tiempo_s    = paquete["ts"] - tiempo_base
-            tp_promedio = sum(temps) / 9.0
+            tp_promedio = sum(temps) / 8.0
 
             if not ignition_countdown:
                 valor_label.config(
@@ -351,10 +357,11 @@ def procesar_queue():
                     font=("Arial", 12), fg="white"
                 )
 
-            linea = f"{timestamp_ms:13} {tiempo_s:10.3f} {thrust:12.3f}"
+            # Línea CSV
+            linea = f"{timestamp_ms},{tiempo_s:.3f},{thrust:.3f}"
             for temp in temps:
-                linea += f" {temp:10.3f}"
-            linea += f" {transducer:12}\n"
+                linea += f",{temp:.3f}"
+            linea += f",{transducer:.6f}\n"
             _archivo.write(linea)
             _archivo.flush()
 
@@ -384,8 +391,8 @@ def actualizar_graficas():
         ax_presion.grid(True)
         ax_presion.legend()
 
-        ax_n.plot(t, list(ns), color="#C88A53", label="Transducer")
-        ax_n.set_ylabel("Transducer [raw]")
+        ax_n.plot(t, list(ns), color="#C88A53", label="Pressure")
+        ax_n.set_ylabel("Pressure [bar]")
         ax_n.grid(True)
         ax_n.legend()
 
@@ -489,31 +496,31 @@ fig.patch.set_facecolor("#5F5A7A")
 canvas = FigureCanvasTkAgg(fig, master=frame_graficas)
 canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-# Sensor table — 9 termopares: 5 en col 0, 4 en col 1
+# Sensor table — 8 termopares: 4 en col 0, 4 en col 1
 tabla_valores = []
-for i in range(9):
+for i in range(8):
     var  = tk.StringVar(value=f"Tp{i+1}: 0.00")
-    fila = i % 5
-    col  = i // 5
+    fila = i % 4
+    col  = i // 4
     tk.Label(frame_tabla, textvariable=var, width=16, anchor="w",
              font=("Arial", 12, "bold"), bg="#5F5A7A", fg="white"
              ).grid(row=fila, column=col, padx=4, pady=4, sticky="w")
     tabla_valores.append(var)
 
-ps_var = tk.StringVar(value="Ps: 0.00")
+ps_var = tk.StringVar(value="Thrust: 0.00 N")
 tk.Label(frame_tabla, textvariable=ps_var, width=16, anchor="w",
          font=("Arial", 12, "bold"), bg="#5F5A7A", fg="white"
-         ).grid(row=5, column=0, padx=4, pady=6, sticky="w")
+         ).grid(row=4, column=0, padx=4, pady=6, sticky="w")
 
-n_var = tk.StringVar(value="N: 0.00")
-tk.Label(frame_tabla, textvariable=n_var, width=16, anchor="w",
+n_var = tk.StringVar(value="Pressure: 0.0000 bar")
+tk.Label(frame_tabla, textvariable=n_var, width=22, anchor="w",
          font=("Arial", 12, "bold"), bg="#5F5A7A", fg="white"
-         ).grid(row=5, column=1, padx=4, pady=6, sticky="w")
+         ).grid(row=4, column=1, padx=4, pady=6, sticky="w")
 
 timestamp_var = tk.StringVar(value="Timestamp: 0 ms")
 tk.Label(frame_tabla, textvariable=timestamp_var, width=34, anchor="w",
          font=("Arial", 10, "bold"), bg="#5F5A7A", fg="white"
-         ).grid(row=6, column=0, columnspan=2, padx=4, pady=6, sticky="w")
+         ).grid(row=5, column=0, columnspan=2, padx=4, pady=6, sticky="w")
 
 ventana.protocol("WM_DELETE_WINDOW", cerrar)
 ventana.after(1000, refrescar_puertos)
