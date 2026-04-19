@@ -21,6 +21,21 @@ COMANDO_IGNICION  = b'\x04'
 MAX_PUNTOS        = 1000
 # ----------------------------------
 
+# ---------- PRESIÓN: constantes precalculadas ----------
+# Original pipeline:
+#   v   = (raw / 4095) * 3.3
+#   i   = v / 150
+#   psi = (i - 0.004) * 312500
+#   bar = psi * 0.0689476 + 1.01325
+#
+# Desarrollado:
+#   bar = raw * (3.3 / 4095 / 150 * 312500 * 0.0689476)
+#              + (-0.004 * 312500 * 0.0689476 + 1.01325)
+#
+_BAR_K      = (3.3 / 4095) / 150 * 312500 * 0.0689476   # ≈ 1.1065e-4  bar/LSB
+_BAR_OFFSET = -0.004 * 312500 * 0.0689476 + 1.01325      # ≈ -85.1735   bar
+# bar = raw * _BAR_K + _BAR_OFFSET
+# -------------------------------------------------------
 
 # ---------- VARIABLES GLOBALES ----------
 ser               = None
@@ -281,18 +296,23 @@ def leer_datos():
                           for i in range(8)]
 
         transducer_raw = struct.unpack("<H", payload[24:26])[0]
-        transducer_raw = (transducer_raw / 4095) / 3.3
-        transducer_raw = (transducer_raw / 150 - 0.004) * 312500
-        transducer_raw = (transducer_raw * 0.0689476) + 1.01325
+
+        # Commented out step-by-step calculation — replaced by precalculated constants above
+        # v = (transducer_raw / 4095) * 3.3
+        # i = v / 150
+        # psi = (i - 0.004) * 312500
+        # bar = (psi * 0.0689476) + 1.01325
+        bar = transducer_raw * _BAR_K + _BAR_OFFSET
 
         paquete = {
-            "tipo":         "datos",
-            "timestamp_ms": timestamp_ms,
-            "thrust":       thrust,
-            "temps":        temps,
-            "transducer":   transducer_raw,
-            "hz":           hz_actual,
-            "ts":           time.time(),
+            "tipo":             "datos",
+            "timestamp_ms":     timestamp_ms,
+            "thrust":           thrust,
+            "temps":            temps,
+            "transducer":       bar,
+            "transducer_raw":   transducer_raw,
+            "hz":               hz_actual,
+            "ts":               time.time(),
         }
 
         try:
@@ -331,16 +351,18 @@ def procesar_queue():
             ventana.after(0, desconectar)
             return
 
-        thrust       = paquete["thrust"]
-        temps        = paquete["temps"]
-        transducer   = paquete["transducer"]
-        timestamp_ms = paquete["timestamp_ms"]
-        hz           = paquete["hz"]
+        thrust         = paquete["thrust"]
+        temps          = paquete["temps"]
+        transducer     = paquete["transducer"]
+        transducer_raw = paquete["transducer_raw"]
+        timestamp_ms   = paquete["timestamp_ms"]
+        hz             = paquete["hz"]
 
         for i in range(8):
             tabla_valores[i].set(f"Tp{i+1}: {temps[i]:.2f}°C")
         ps_var.set(f"Thrust: {thrust:.2f} N")
         n_var.set(f"Pressure: {transducer:.4f} bar")
+        raw_var.set(f"Raw ADC: {transducer_raw}")
         timestamp_var.set(f"Timestamp: {timestamp_ms} ms")
         if hz > 0:
             hz_label.config(text=f"Frecuencia: {hz:.1f} Hz")
@@ -517,10 +539,16 @@ tk.Label(frame_tabla, textvariable=n_var, width=22, anchor="w",
          font=("Arial", 12, "bold"), bg="#5F5A7A", fg="white"
          ).grid(row=4, column=1, padx=4, pady=6, sticky="w")
 
+# Raw ADC reading from the transducer
+raw_var = tk.StringVar(value="Raw Transducer: 0")
+tk.Label(frame_tabla, textvariable=raw_var, width=16, anchor="w",
+         font=("Arial", 12, "bold"), bg="#5F5A7A", fg="white"
+         ).grid(row=5, column=0, padx=4, pady=6, sticky="w")
+
 timestamp_var = tk.StringVar(value="Timestamp: 0 ms")
 tk.Label(frame_tabla, textvariable=timestamp_var, width=34, anchor="w",
          font=("Arial", 10, "bold"), bg="#5F5A7A", fg="white"
-         ).grid(row=5, column=0, columnspan=2, padx=4, pady=6, sticky="w")
+         ).grid(row=6, column=0, columnspan=2, padx=4, pady=6, sticky="w")
 
 ventana.protocol("WM_DELETE_WINDOW", cerrar)
 ventana.after(1000, refrescar_puertos)
